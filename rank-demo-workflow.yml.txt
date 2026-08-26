@@ -1,0 +1,1235 @@
+name: Build Rank Demo APK
+
+# A one-screen test app, separate from the real one.
+#
+# The reader that fills the Win Rate Rank table has never seen Chamet's own
+# rank screen - it is written against what that screen ought to look like in
+# the view tree, which is a guess until somebody points it at the real thing.
+# Shipping a guess into the app that prices every bet is the wrong order to
+# do this in.
+#
+# So this builds a tiny separate app that does the reading and prints the
+# result, and nothing else: no WebView, no database, no network, no signing
+# key, and a different package id so it installs alongside rather than over
+# the real app. If the table comes back right, the same parser goes into the
+# app unchanged - it is copied from the app's own source here, not rewritten.
+# If it comes back wrong, the Copy button hands over the actual view tree and
+# the parser gets fixed against that instead of against a guess.
+#
+# Run it by hand from the Actions tab - it deliberately does not fire on push.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write the project
+        run: |
+          mkdir -p app/src/main/java/com/racexai/rankdemo app/src/main/res/values app/src/main/res/xml
+          cat > settings.gradle <<'___RXA_EOF___'
+          pluginManagement{ repositories{ google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement{ repositories{ google(); mavenCentral() } }
+          rootProject.name="RankDemo"
+          include ":app"
+          ___RXA_EOF___
+          cat > build.gradle <<'___RXA_EOF___'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          ___RXA_EOF___
+          cat > gradle.properties <<'___RXA_EOF___'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          ___RXA_EOF___
+          cat > app/build.gradle <<'___RXA_EOF___'
+          apply plugin: 'com.android.application'
+
+          // A DIFFERENT applicationId FROM THE REAL APP, ON PURPOSE.
+          //
+          // Same id would mean installing this over Race x AI Bot - and since the two
+          // are signed by different keys Android would refuse, or worse, succeed and
+          // take the race history with it. This installs alongside and can be removed
+          // without touching anything.
+          android {
+              namespace 'com.racexai.rankdemo'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.racexai.rankdemo"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode (System.getenv("GITHUB_RUN_NUMBER") ?: "1") as int
+                  versionName "demo-" + (System.getenv("GITHUB_RUN_NUMBER") ?: "1")
+              }
+              // Debug signing is deliberate: this app has no data worth protecting and
+              // no update path to preserve, so it never needs the real signing key -
+              // which means that key does not have to appear in this file at all.
+              buildTypes { debug { } }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          ___RXA_EOF___
+          cat > app/src/main/AndroidManifest.xml <<'___RXA_EOF___'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="false"
+                  android:label="Win Rate Rank test"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:resizeableActivity="true"
+                      android:launchMode="singleTask"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|fontScale">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <!-- Reads whatever is in the other half of the split screen and prints
+                       what it made of it. No packageNames filter: the game ships under
+                       several names, and restricting to one is how the real app spent
+                       weeks reading nothing at all. -->
+                  <service
+                      android:name=".DemoService"
+                      android:exported="false"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/demo_config"/>
+                  </service>
+              </application>
+          </manifest>
+          ___RXA_EOF___
+          cat > app/src/main/res/xml/demo_config.xml <<'___RXA_EOF___'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="300"
+              android:description="@string/demo_desc" />
+          ___RXA_EOF___
+          cat > app/src/main/res/values/strings.xml <<'___RXA_EOF___'
+          <resources>
+            <string name="demo_desc">Reads the Win Rate Rank screen in the game and shows what it found. It reads only - it never taps anything.</string>
+          </resources>
+          ___RXA_EOF___
+          cat > app/src/main/java/com/racexai/rankdemo/RaceReader.java <<'___RXA_EOF___'
+          package com.racexai.rankdemo;
+
+          import java.util.ArrayList;
+          import java.util.LinkedHashSet;
+          import java.util.List;
+
+          /**
+           * Turns one dumped frame into the handful of facts the bot actually needs, and
+           * works out when a race starts and ends.
+           *
+           * This exists because shipping 400KB of view tree back and forth does not work -
+           * it gets truncated in transit and the interesting moment is never in the part
+           * that survives. The phone can do the reading itself and report a dozen lines.
+           *
+           * Deliberately free of Android imports so the parsing can be run and checked on
+           * a desktop against real dumps before it ever reaches a device.
+           */
+          public class RaceReader {
+
+              /**
+               * Longest first, on purpose. "Sports Car" has to be tested before "Car" or
+               * the shorter name matches inside the longer one and every Sports Car win is
+               * recorded as a Car win.
+               */
+              private static final String[] VEHICLES = {
+                  "Monster Truck", "Sports Car", "Stock Car", "Supercar",
+                  "Motorcycle", "ATV", "ORV", "SUV", "Car"
+              };
+
+              /**
+               * The six surfaces. Needed here so a track sign can be told apart from the
+               * "???" placeholder on the two tracks the game keeps back - matching a known
+               * name is the only reliable test, since the placeholder text varies by
+               * locale and by build.
+               */
+              private static final String[] ROADS = {
+                  "Expressway", "Potholes", "Highway", "Desert", "Bumpy", "Dirt"
+              };
+
+              public static class Frame {
+                  public final List<String> cars = new ArrayList<>();   // left to right
+                  public final List<String> odds = new ArrayList<>();
+                  public final List<String> bets = new ArrayList<>();   // crowd stake per vehicle
+                  public String road;              // the one revealed track
+                  public int slot = -1;            // 1..3, which track is revealed
+                  public String countdown;
+                  public String winner;            // from the result banner: "SUV won, Next 8 s"
+                  public boolean betOpen;          // betting panel has height => betting is open
+                  public final LinkedHashSet<String> pairs = new LinkedHashSet<>();  // "id=text"
+
+                  /**
+                   * Every track sign on screen, left to right, exactly as the view tree
+                   * gives them - "???" placeholders included, and each one's content
+                   * description appended after a | if it has one.
+                   *
+                   * Knowing all three surfaces before the bet is worth about seventeen
+                   * points of accuracy, so the one question worth keeping open is whether
+                   * the game's own client is holding the hidden two and merely declining
+                   * to draw them. A screen reader would be told if it were. This records
+                   * what is actually there, every race, so the question gets settled by
+                   * evidence rather than by assuming the answer.
+                   */
+                  public final List<String> signs = new ArrayList<>();
+
+                  /**
+                   * The signs that name a real surface, left to right, with an empty
+                   * string wherever one still reads "???". Once the race starts the game
+                   * fills all three in, and that is the only moment the hidden two are
+                   * ever visible.
+                   */
+                  public final List<String> namedRoads = new ArrayList<>();
+              }
+
+              /**
+               * Was the last board read from the view ids we know, or from the words on
+               * screen? Shown in the diagnostic, so "it works on ChillChat" is a fact
+               * about which route got there rather than a guess.
+               */
+              public static volatile boolean byContent = false;
+
+              public static Frame parse(String dump) {
+                  byContent = false;
+                  Frame f = new Frame();
+                  List<int[]> tracks = new ArrayList<>();      // {left, hasSign}
+                  List<String[]> carsAt = new ArrayList<>();   // {left, name}
+                  List<String[]> oddsAt = new ArrayList<>();
+                  List<String[]> betsAt = new ArrayList<>();
+                  List<String[]> signsAt = new ArrayList<>();  // {left, text|desc}
+
+                  for (String line : dump.split("\n")) {
+                      int p = line.indexOf("id=");
+                      if (p < 0) continue;
+                      int q = p + 3;
+                      while (q < line.length() && line.charAt(q) != ' ' && line.charAt(q) != '\n') q++;
+                      String vid = line.substring(p + 3, q);
+                      int slash = vid.lastIndexOf(":id/");
+                      if (slash >= 0) vid = vid.substring(slash + 4);
+
+                      String text = between(line, "TEXT=\"", "\"");
+                      String desc = between(line, "DESC=\"", "\"");
+                      int[] b = bounds(line);
+
+                      if (text != null && text.length() > 0) {
+                          f.pairs.add(vid + "=" + text);
+                          if (f.winner == null) f.winner = winnerIn(text);
+                      }
+
+                      if (vid.equals("gameBetView") && b != null) f.betOpen = (b[3] - b[1]) > 50;
+                      else if (vid.equals("tv_car_name") && text != null)
+                          carsAt.add(new String[]{ String.valueOf(b == null ? 0 : b[0]), text });
+                      else if (vid.equals("tv_car_odds") && text != null)
+                          oddsAt.add(new String[]{ String.valueOf(b == null ? 0 : b[0]), text });
+                      else if (vid.equals("tv_totalBet") && text != null)
+                          betsAt.add(new String[]{ String.valueOf(b == null ? 0 : b[0]), text });
+                      else if (vid.equals("tv_track_sign") && (text != null || desc != null)) {
+                          // Record every sign, then pick the revealed road from whichever
+                          // one names a surface we know. Taking the last sign to carry any
+                          // text at all - which is what this did - hands back "???" the
+                          // moment the placeholders turn out to share this id, and the
+                          // whole board is then filled against the wrong road.
+                          signsAt.add(new String[]{ String.valueOf(b == null ? 0 : b[0]),
+                                                    (text == null ? "" : text)
+                                                    + (desc == null ? "" : "|" + desc) });
+                          String known = roadIn(text);
+                          if (known == null) known = roadIn(desc);
+                          if (known != null) f.road = known;
+                      }
+                      else if (vid.equals("tv_race_surplus") && text != null) f.countdown = text;
+                      else if (vid.equals("cl_track_content") && b != null) tracks.add(new int[]{ b[0], 0 });
+                      else if (vid.equals("ll_track_sign") && b != null) {
+                          // the revealed track is whichever track box this sign sits inside
+                          for (int[] t : tracks) if (b[0] >= t[0] - 20 && b[0] <= t[0] + 400) t[1] = 1;
+                      }
+                  }
+
+                  // ── WHEN THE IDS ARE NOT THE ONES WE KNOW ──
+                  //
+                  // Everything above is keyed off exact view ids - tv_car_name,
+                  // tv_car_odds, tv_track_sign. On the build those came from that is
+                  // precise and fast. On a build that names its views anything else it
+                  // finds nothing at all, silently, and the bot sits there doing nothing
+                  // with no way to say why. That is the same mistake as reading one
+                  // hardcoded package name, one layer further in.
+                  //
+                  // A view id is a label. The CONTENT is the thing. "Monster Truck" is a
+                  // vehicle name whatever the box holding it is called, and there are only
+                  // nine of them. So when the ids find no board, the names are looked for
+                  // directly - and because a chat message could easily contain the word
+                  // "SUV", the text has to be EXACTLY a vehicle name and there have to be
+                  // three of them sitting in a row.
+                  if (carsAt.size() < 3) {
+                      byContent = readByContent(dump, carsAt, oddsAt, signsAt, f);
+                      // WHETHER BETTING IS OPEN, on a build that has no gameBetView.
+                      //
+                      // betOpen is measured from the height of one particular view, and a
+                      // build that does not have that view leaves it false forever - so
+                      // the watcher never fills a board it read perfectly well. The view
+                      // was only ever a proxy for the real question anyway: the board is
+                      // on screen and the race has not finished. When there is no view to
+                      // ask, ask that instead.
+                      if (byContent && dump.indexOf("gameBetView") < 0)
+                          f.betOpen = (carsAt.size() == 3 && f.winner == null);
+                  }
+
+                  sortByLeft(carsAt);
+                  sortByLeft(oddsAt);
+                  sortByLeft(betsAt);
+                  sortByLeft(signsAt);
+                  for (String[] c : carsAt) f.cars.add(c[1]);
+                  for (String[] o : oddsAt) f.odds.add(o[1]);
+                  for (String[] o : betsAt) f.bets.add(o[1]);
+                  for (String[] s : signsAt) f.signs.add(s[1]);
+                  // the same signs, resolved to surface names where they name one
+                  for (String[] s : signsAt) {
+                      String r = roadIn(s[1]);
+                      f.namedRoads.add(r == null ? "" : r);
+                  }
+                  // a board with a "???" on it has not revealed anything
+                  for (String r : f.namedRoads) if (r.isEmpty()) { f.namedRoads.clear(); break; }
+
+                  // tracks in screen order; the one carrying a sign is the revealed slot
+                  for (int i = 0; i < tracks.size(); i++)
+                      for (int j = i + 1; j < tracks.size(); j++)
+                          if (tracks.get(j)[0] < tracks.get(i)[0]) {
+                              int[] tmp = tracks.get(i); tracks.set(i, tracks.get(j)); tracks.set(j, tmp);
+                          }
+                  for (int i = 0; i < tracks.size(); i++) if (tracks.get(i)[1] == 1) f.slot = i + 1;
+
+                  // THE SIGNS THEMSELVES SAY WHICH SLOT IT IS.
+                  //
+                  // Above, the slot comes from which track BOX contains a sign - which
+                  // needs cl_track_content and ll_track_sign to be named exactly that. But
+                  // the answer is already sitting in the signs: two of them read "???" and
+                  // one names a road, and the one that names a road is the revealed slot.
+                  // No ids required, and it agrees with the box method wherever both work.
+                  if (f.slot < 1 && signsAt.size() >= 2) {
+                      int named = -1, count = 0;
+                      for (int i = 0; i < signsAt.size(); i++) {
+                          if (roadIn(signsAt.get(i)[1]) != null) { named = i; count++; }
+                      }
+                      if (count == 1) f.slot = named + 1;
+                  }
+
+                  return f;
+              }
+
+              /**
+               * Find the board by what it says rather than by what its views are called.
+               *
+               * Returns true if a board was actually found this way. Deliberately strict:
+               * a wrong board is far worse than no board, because a wrong one gets logged
+               * and teaches the models something untrue, while no board just means the bot
+               * waits. So the vehicle name has to match a known one exactly, three of them
+               * have to sit in the same horizontal band, and odds are only taken when each
+               * car has exactly one plausible number lined up beneath it.
+               */
+              private static boolean readByContent(String dump, List<String[]> carsAt,
+                                                   List<String[]> oddsAt, List<String[]> signsAt,
+                                                   Frame f) {
+                  List<int[]> carXY = new ArrayList<>();       // {x, y}
+                  List<String> carName = new ArrayList<>();
+                  List<int[]> numXY = new ArrayList<>();       // {x, y}
+                  List<String> numText = new ArrayList<>();
+                  List<int[]> signXY = new ArrayList<>();
+                  List<String> signText = new ArrayList<>();
+
+                  for (String line : dump.split("\n")) {
+                      String text = between(line, "TEXT=\"", "\"");
+                      String desc = between(line, "DESC=\"", "\"");
+                      int[] b = bounds(line);
+                      if (b == null) continue;
+                      int cx = (b[0] + b[2]) / 2, cy = (b[1] + b[3]) / 2;
+
+                      String v = exactVehicle(text);
+                      if (v == null) v = exactVehicle(desc);
+                      if (v != null) { carXY.add(new int[]{ cx, cy }); carName.add(v); continue; }
+
+                      String r = exactRoad(text);
+                      if (r == null) r = exactRoad(desc);
+                      if (r != null || isPlaceholder(text)) {
+                          signXY.add(new int[]{ cx, cy });
+                          signText.add(r != null ? r : (text == null ? "" : text));
+                          continue;
+                      }
+
+                      if (looksLikeOdds(text)) { numXY.add(new int[]{ cx, cy }); numText.add(text); }
+                  }
+
+                  if (carName.size() < 3) return false;
+
+                  // THREE IN A ROW. A board draws its three vehicles side by side, so the
+                  // right three share a horizontal band. Anything scattered down the
+                  // screen is a chat message that happens to contain a vehicle name.
+                  int bestStart = -1, bestCount = 0, bestY = 0;
+                  for (int i = 0; i < carXY.size(); i++) {
+                      int n = 0, sum = 0;
+                      for (int j = 0; j < carXY.size(); j++)
+                          if (Math.abs(carXY.get(j)[1] - carXY.get(i)[1]) <= 120) { n++; sum += carXY.get(j)[1]; }
+                      if (n > bestCount) { bestCount = n; bestStart = i; bestY = sum / n; }
+                  }
+                  if (bestCount < 3) return false;
+
+                  List<Integer> pick = new ArrayList<>();
+                  for (int j = 0; j < carXY.size(); j++)
+                      if (Math.abs(carXY.get(j)[1] - bestY) <= 120) pick.add(j);
+                  // more than three means something else on screen is named like a vehicle
+                  if (pick.size() != 3) return false;
+
+                  for (int j : pick)
+                      carsAt.add(new String[]{ String.valueOf(carXY.get(j)[0]), carName.get(j) });
+
+                  // ODDS, only when each car has exactly one number under it.
+                  //
+                  // Half a set of odds is worse than none: the app would pair them with
+                  // the wrong vehicles and a model would be fitted to nonsense. All three
+                  // or nothing.
+                  List<String[]> got = new ArrayList<>();
+                  for (int j : pick) {
+                      int cx = carXY.get(j)[0], hits = 0;
+                      String best = null;
+                      for (int k = 0; k < numXY.size(); k++) {
+                          int dy = numXY.get(k)[1] - bestY;
+                          if (dy < -40 || dy > 320) continue;               // beneath the name
+                          if (Math.abs(numXY.get(k)[0] - cx) > 90) continue; // in its column
+                          hits++; best = numText.get(k);
+                      }
+                      if (hits == 1) got.add(new String[]{ String.valueOf(cx), best });
+                  }
+                  if (got.size() == 3) oddsAt.addAll(got);
+
+                  // the track signs, if the ids did not already find them
+                  if (signsAt.isEmpty() && signText.size() >= 2) {
+                      for (int i = 0; i < signText.size(); i++) {
+                          signsAt.add(new String[]{ String.valueOf(signXY.get(i)[0]), signText.get(i) });
+                          String known = roadIn(signText.get(i));
+                          if (known != null && f.road == null) f.road = known;
+                      }
+                  }
+                  return true;
+              }
+
+              /**
+               * Is there a betting board in this dump, judged by content alone?
+               *
+               * Used by the watcher to decide whether a screen is worth reading at all,
+               * on builds whose view ids we do not recognise. Runs the real parser rather
+               * than a cheaper approximation, because "the parser can read it" is the only
+               * definition of "there is a board here" that is actually useful - a test
+               * that says yes to something the parser then cannot read would just move the
+               * silence one step later.
+               */
+              public static boolean looksLikeBoard(String dump) {
+                  try {
+                      Frame f = parse(dump);
+                      return f.cars.size() == 3;
+                  } catch (Exception e) { return false; }
+              }
+
+              /* ══════════════════════════════════════════════════════════════════
+                 THE GAME'S OWN WIN RATE RANK SCREEN
+
+                 Nine rows, each a vehicle with its win rate and its payout. Open it
+                 in Chamet and the eighteen numbers are right there on screen - so
+                 there is no good reason to make anybody copy them into the app by
+                 hand, twice, squinting between two halves of a split screen.
+
+                 WHAT THIS DOES NOT DO IS TRUST THE LAYOUT. No view ids are used at
+                 all: this build names them one thing, the next build names them
+                 another, and a rank reader that silently returns nothing on a
+                 renamed screen is worse than none. It finds the nine vehicle names
+                 by their words, then takes the numbers that sit on the same ROW as
+                 each - which is a fact about the picture, not about the code that
+                 drew it.
+
+                 THE ACCEPTANCE TEST IS THE INTERESTING PART. Any screen with words
+                 and numbers on it can be mispaired into a plausible-looking table,
+                 and a wrong rank table would poison every price in the app while
+                 looking perfectly filled in. So the pairing has to prove itself:
+
+                     win rate x payout ~= 0.98,  for every row
+
+                 That is not a coincidence to be checked against - it is how the
+                 game prices the thing. It keeps about 2% and hands back the rest.
+                 A row where the two numbers came from different places will not
+                 land near 0.98, and seven rows in a row landing there by accident
+                 is not something that happens. If the margins do not agree, this
+                 returns nothing and says why.
+                 ══════════════════════════════════════════════════════════════════ */
+
+              public static class RankRow {
+                  public final String vehicle;
+                  public final double winPct;   // 39.4
+                  public final double payout;   // 2.5
+                  RankRow(String v, double w, double p) { vehicle = v; winPct = w; payout = p; }
+                  public double margin() { return winPct / 100.0 * payout; }
+              }
+
+              public static class Rank {
+                  public final List<RankRow> rows = new ArrayList<>();
+                  /** mean of winRate x payout across the rows - the game's own take */
+                  public double margin;
+                  /** why nothing was returned, when nothing was */
+                  public String why = "no rank screen here";
+              }
+
+              private static final int RANK_MIN_ROWS = 7;      // of nine
+              private static final double MARGIN_LO = 0.80;    // the game keeps 2%; allow
+              private static final double MARGIN_HI = 1.15;    // for rounding and odd builds
+
+              /**
+               * Cheap enough to run on every frame. The betting board names three
+               * vehicles; only the rank screen names seven or more.
+               */
+              public static int vehicleLabels(String dump) {
+                  LinkedHashSet<String> seen = new LinkedHashSet<>();
+                  for (String line : dump.split("\n")) {
+                      String v = exactVehicle(between(line, "TEXT=\"", "\""));
+                      if (v == null) v = exactVehicle(between(line, "DESC=\"", "\""));
+                      if (v != null) seen.add(v);
+                  }
+                  return seen.size();
+              }
+
+              public static boolean looksLikeRank(String dump) {
+                  return vehicleLabels(dump) >= RANK_MIN_ROWS && parseRank(dump).rows.size() >= RANK_MIN_ROWS;
+              }
+
+              public static Rank parseRank(String dump) {
+                  Rank out = new Rank();
+                  List<double[]> nums = new ArrayList<>();      // {y, value, used}
+                  List<Object[]> names = new ArrayList<>();     // {y, name}
+
+                  for (String line : dump.split("\n")) {
+                      int[] b = bounds(line);
+                      if (b == null) continue;
+                      double y = (b[1] + b[3]) / 2.0;
+                      String text = between(line, "TEXT=\"", "\"");
+                      if (text == null || text.trim().length() == 0) text = between(line, "DESC=\"", "\"");
+                      if (text == null) continue;
+                      String v = exactVehicle(text);
+                      if (v != null) { names.add(new Object[]{ y, v }); continue; }
+                      double n = number(text);
+                      if (!Double.isNaN(n)) nums.add(new double[]{ y, n, 0 });
+                  }
+                  if (names.size() < RANK_MIN_ROWS) { out.why = "only " + names.size() + " vehicles named"; return out; }
+
+                  // How tall is a row? Taken from the gaps between the vehicle names
+                  // themselves rather than typed in, so it holds at any screen density.
+                  double tol = rowTolerance(names);
+
+                  // Two numbers per vehicle. Which is the win rate and which the payout
+                  // is decided by size, not by column order: a payout is a small
+                  // multiplier, a win rate is a percentage. Builds that swap the columns
+                  // round therefore read the same.
+                  List<RankRow> got = new ArrayList<>();
+                  LinkedHashSet<String> done = new LinkedHashSet<>();
+                  for (Object[] nm : names) {
+                      double y = (Double) nm[0];
+                      String v = (String) nm[1];
+                      if (done.contains(v)) continue;
+                      double[] a = nearest(nums, y, tol, null);
+                      if (a == null) continue;
+                      double[] c = nearest(nums, y, tol, a);
+                      if (c == null) { a[2] = 0; continue; }
+                      double hi = Math.max(a[1], c[1]), lo = Math.min(a[1], c[1]);
+                      if (!(lo >= 1.0 && lo <= 30.0)) { a[2] = 0; c[2] = 0; continue; }   // payout
+                      if (!(hi >= 3.0 && hi <= 80.0)) { a[2] = 0; c[2] = 0; continue; }   // win %
+                      done.add(v);
+                      got.add(new RankRow(v, hi, lo));
+                  }
+                  if (got.size() < RANK_MIN_ROWS) { out.why = "only " + got.size() + " rows paired up"; return out; }
+
+                  // ── and now the part that decides whether to believe any of it ──
+                  double sum = 0;
+                  for (RankRow r : got) sum += r.margin();
+                  double mean = sum / got.size();
+                  double worst = 0;
+                  for (RankRow r : got) worst = Math.max(worst, Math.abs(r.margin() - mean));
+                  if (mean < MARGIN_LO || mean > MARGIN_HI) {
+                      out.why = "the numbers do not price a race (margin " + round2(mean) + ")";
+                      return out;
+                  }
+                  if (worst > 0.16) {
+                      out.why = "rows disagree with each other (worst off by " + round2(worst) + ")";
+                      return out;
+                  }
+                  out.rows.addAll(got);
+                  out.margin = mean;
+                  out.why = "";
+                  return out;
+              }
+
+              /** Half the typical gap between one vehicle row and the next. */
+              private static double rowTolerance(List<Object[]> names) {
+                  List<Double> ys = new ArrayList<>();
+                  for (Object[] n : names) ys.add((Double) n[0]);
+                  for (int i = 0; i < ys.size(); i++)
+                      for (int j = i + 1; j < ys.size(); j++)
+                          if (ys.get(j) < ys.get(i)) { double t = ys.get(i); ys.set(i, ys.get(j)); ys.set(j, t); }
+                  double best = -1;
+                  for (int i = 1; i < ys.size(); i++) {
+                      double g = ys.get(i) - ys.get(i - 1);
+                      if (g > 1 && (best < 0 || g < best)) best = g;
+                  }
+                  return best < 0 ? 60 : best * 0.45;
+              }
+
+              /** The unused number closest to this row, or null. Marks it used. */
+              private static double[] nearest(List<double[]> nums, double y, double tol, double[] skip) {
+                  double[] best = null;
+                  double bd = 0;
+                  for (double[] n : nums) {
+                      if (n[2] != 0 || n == skip) continue;
+                      double d = Math.abs(n[0] - y);
+                      if (d > tol) continue;
+                      if (best == null || d < bd) { best = n; bd = d; }
+                  }
+                  if (best != null) best[2] = 1;
+                  return best;
+              }
+
+              /**
+               * "39.4%", "39.4 %", "x2.5", "2.5X", "2,5" - one number, or NaN.
+               *
+               * Bare integers are refused: a rank screen is full of positions, ranks
+               * and counts, and letting "3" become a payout is how a mispaired table
+               * gets built. Both real columns carry a decimal point or a % sign.
+               */
+              static double number(String text) {
+                  if (text == null) return Double.NaN;
+                  String t = text.trim().toLowerCase();
+                  boolean pct = t.endsWith("%");
+                  if (pct) t = t.substring(0, t.length() - 1).trim();
+                  if (t.startsWith("x")) t = t.substring(1).trim();
+                  if (t.endsWith("x")) t = t.substring(0, t.length() - 1).trim();
+                  t = t.replace(',', '.');
+                  if (t.length() == 0 || (!pct && t.indexOf('.') < 0)) return Double.NaN;
+                  for (int i = 0; i < t.length(); i++) {
+                      char c = t.charAt(i);
+                      if (!Character.isDigit(c) && c != '.') return Double.NaN;
+                  }
+                  try {
+                      double d = Double.parseDouble(t);
+                      return (d > 0 && d < 1000) ? d : Double.NaN;
+                  } catch (Exception e) { return Double.NaN; }
+              }
+
+              private static double round2(double d) { return Math.round(d * 100) / 100.0; }
+
+              /** The table as the WebView wants it: [["ORV",39.5,2.5],...] */
+              public static String rankJs(Rank r) {
+                  StringBuilder sb = new StringBuilder("[");
+                  for (int i = 0; i < r.rows.size(); i++) {
+                      RankRow w = r.rows.get(i);
+                      if (i > 0) sb.append(',');
+                      sb.append("[\"").append(w.vehicle).append("\",")
+                        .append(round2(w.winPct)).append(',').append(round2(w.payout)).append(']');
+                  }
+                  return sb.append(']').toString();
+              }
+
+              /** Something short and stable, so the same table is not applied twice. */
+              public static String rankKey(Rank r) {
+                  StringBuilder sb = new StringBuilder();
+                  for (RankRow w : r.rows)
+                      sb.append(w.vehicle).append(round2(w.winPct)).append('/').append(round2(w.payout)).append(';');
+                  return sb.toString();
+              }
+
+              /** Exactly one of the nine vehicles - not merely a line mentioning one. */
+              static String exactVehicle(String text) {
+                  if (text == null) return null;
+                  String t = text.trim();
+                  for (String v : VEHICLES) if (t.equalsIgnoreCase(v)) return v;
+                  return null;
+              }
+
+              /** Exactly one of the six surfaces. */
+              static String exactRoad(String text) {
+                  if (text == null) return null;
+                  String t = text.trim();
+                  for (String r : ROADS) if (t.equalsIgnoreCase(r)) return r;
+                  return null;
+              }
+
+              /**
+               * The "???" a hidden track shows. The exact characters vary by build and by
+               * language, so this asks whether the label is short and carries no letters
+               * or digits rather than matching one spelling of it.
+               */
+              static boolean isPlaceholder(String text) {
+                  if (text == null) return false;
+                  String t = text.trim();
+                  if (t.length() == 0 || t.length() > 6) return false;
+                  for (int i = 0; i < t.length(); i++) {
+                      char c = t.charAt(i);
+                      if (Character.isLetterOrDigit(c)) return false;
+                  }
+                  return true;
+              }
+
+              /**
+               * A betting multiplier: "2.45", "x2.45", "2.45X". Must carry a decimal point
+               * and land in a believable range - a bare integer is far more likely to be a
+               * seat number, a countdown or somebody's coin balance.
+               */
+              static boolean looksLikeOdds(String text) {
+                  if (text == null) return false;
+                  String t = text.trim().toLowerCase();
+                  if (t.startsWith("x")) t = t.substring(1);
+                  if (t.endsWith("x")) t = t.substring(0, t.length() - 1);
+                  if (t.indexOf('.') < 0) return false;
+                  for (int i = 0; i < t.length(); i++) {
+                      char c = t.charAt(i);
+                      if (!Character.isDigit(c) && c != '.') return false;
+                  }
+                  try {
+                      double d = Double.parseDouble(t);
+                      return d >= 1.0 && d <= 200.0;
+                  } catch (Exception e) { return false; }
+              }
+
+              /**
+               * The result banner reads "SUV won, Next 8 s". Matching a bare " won" would
+               * also swallow the group chat sitting above the game - "1 winner(s) in our
+               * group won 4,881,078 in Lucky Race!" - so the text has to START with a
+               * vehicle name we recognise.
+               */
+              /** The surface named in this label, or null for "???" and anything else. */
+              static String roadIn(String text) {
+                  if (text == null) return null;
+                  for (String r : ROADS) if (text.equals(r)) return r;
+                  for (String r : ROADS) if (text.contains(r)) return r;
+                  return null;
+              }
+
+              static String winnerIn(String text) {
+                  for (String v : VEHICLES) {
+                      if (text.startsWith(v + " won")) return v;
+                  }
+                  return null;
+              }
+
+              private static void sortByLeft(List<String[]> list) {
+                  for (int i = 0; i < list.size(); i++)
+                      for (int j = i + 1; j < list.size(); j++)
+                          if (Integer.parseInt(list.get(j)[0]) < Integer.parseInt(list.get(i)[0])) {
+                              String[] tmp = list.get(i); list.set(i, list.get(j)); list.set(j, tmp);
+                          }
+              }
+
+              private static String between(String s, String open, String close) {
+                  int a = s.indexOf(open);
+                  if (a < 0) return null;
+                  a += open.length();
+                  int b = s.indexOf(close, a);
+                  return b < 0 ? null : s.substring(a, b);
+              }
+
+              /** "[l,t-r,b]" -> {l,t,r,b} */
+              private static int[] bounds(String line) {
+                  int a = line.lastIndexOf('[');
+                  int b = line.indexOf(']', a);
+                  if (a < 0 || b < 0) return null;
+                  String in = line.substring(a + 1, b);
+                  try {
+                      int dash = in.indexOf('-', 1);
+                      if (dash < 0) return null;
+                      String[] tl = in.substring(0, dash).split(",");
+                      String[] br = in.substring(dash + 1).split(",");
+                      if (tl.length < 2 || br.length < 2) return null;
+                      return new int[]{ Integer.parseInt(tl[0].trim()), Integer.parseInt(tl[1].trim()),
+                                        Integer.parseInt(br[0].trim()), Integer.parseInt(br[1].trim()) };
+                  } catch (Exception e) { return null; }
+              }
+
+              /**
+               * A compact summary of a frame, for finding out what is actually there.
+               *
+               * The two hidden surfaces are revealed when the race runs - but revealed as
+               * a PICTURE of the track, not as text. There are no track signs on screen at
+               * all once the race starts, which means reading the surfaces from labels,
+               * the way the betting board is read, cannot work no matter how it is
+               * written. That is what the screenshot reader is for.
+               *
+               * This still earns its place: it reports every distinct view id on screen
+               * and every content description found, so if some build ever does tell a
+               * screen reader something a person cannot see, it shows up rather than
+               * being assumed absent.
+               */
+              public static String probe(String dump) {
+                  LinkedHashSet<String> ids = new LinkedHashSet<>();
+                  LinkedHashSet<String> descs = new LinkedHashSet<>();
+                  LinkedHashSet<String> roadish = new LinkedHashSet<>();
+
+                  for (String line : dump.split("\n")) {
+                      int p = line.indexOf("id=");
+                      if (p < 0) continue;
+                      int q = p + 3;
+                      while (q < line.length() && line.charAt(q) != ' ') q++;
+                      String vid = line.substring(p + 3, q);
+                      int slash = vid.lastIndexOf(":id/");
+                      if (slash >= 0) vid = vid.substring(slash + 4);
+                      if (ids.size() < 60) ids.add(vid);
+
+                      String desc = between(line, "DESC=\"", "\"");
+                      if (desc != null && desc.length() > 0 && descs.size() < 20) descs.add(vid + "=" + desc);
+
+                      String text = between(line, "TEXT=\"", "\"");
+                      String r = roadIn(desc);
+                      if (r == null) r = roadIn(text);
+                      if (r == null) r = roadIn(vid);
+                      if (r != null) roadish.add(vid + " -> " + r);
+                  }
+
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("ids: ").append(join(ids, ", "));
+                  sb.append("\ndescriptions: ").append(descs.isEmpty() ? "(none)" : join(descs, " | "));
+                  sb.append("\nanything naming a road: ").append(roadish.isEmpty() ? "(none)" : join(roadish, " | "));
+                  return sb.toString();
+              }
+
+              private static String join(LinkedHashSet<String> set, String sep) {
+                  StringBuilder sb = new StringBuilder();
+                  for (String s : set) { if (sb.length() > 0) sb.append(sep); sb.append(s); }
+                  return sb.toString();
+              }
+
+              /** A one-line description of the board, for the report. */
+              public static String board(Frame f) {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("cars=").append(f.cars)
+                    .append("  road=").append(f.road)
+                    .append("  slot=").append(f.slot)
+                    .append("  odds=").append(f.odds);
+                  if (f.winner != null) sb.append("  WINNER=").append(f.winner);
+                  return sb.toString();
+              }
+          }
+          ___RXA_EOF___
+          cat > app/src/main/java/com/racexai/rankdemo/Seen.java <<'___RXA_EOF___'
+          package com.racexai.rankdemo;
+
+          /**
+           * What the service last saw, where the screen can read it.
+           *
+           * A plain static holder on purpose. This is a test rig with one screen and
+           * one reader, and a bound service, a broadcast or a database would all be
+           * more machinery than the question deserves - the question being "does the
+           * parser read Chamet's Win Rate Rank screen, and if not, what IS on it?".
+           *
+           * Everything here is volatile because the service writes it on its own
+           * reader thread and the activity reads it on the main one.
+           */
+          public class Seen {
+              /** the last screen the service walked, one line per view */
+              public static volatile String dump = "";
+              /** which app it came from */
+              public static volatile String pkg = "";
+              /** how many of the nine vehicle names were on it */
+              public static volatile int names = 0;
+              /** the parse, or why there wasn't one */
+              public static volatile String verdict = "waiting for a screen";
+              public static volatile String table = "";
+              public static volatile double margin = 0;
+              public static volatile int rows = 0;
+              /** when, and how many passes so far - so a frozen screen is obvious */
+              public static volatile long at = 0;
+              public static volatile int passes = 0;
+              /** set once the service is actually running */
+              public static volatile boolean live = false;
+
+              /**
+               * The best screen seen so far, kept separately.
+               *
+               * The rank screen is on display for as long as somebody is reading it,
+               * and then they close it - and if the demo only ever showed the LATEST
+               * frame, the moment they came back to look at the result it would be
+               * showing whatever was on screen afterwards. Whatever named the most
+               * vehicles is kept, because that is the frame worth talking about.
+               */
+              public static volatile String bestDump = "";
+              public static volatile int bestNames = 0;
+              public static volatile String bestVerdict = "";
+              public static volatile String bestTable = "";
+              public static volatile long bestAt = 0;
+
+              public static synchronized void keepIfBest(String d, int n, String v, String t) {
+                  if (n > bestNames || (n == bestNames && n > 0 && !v.startsWith("could not"))) {
+                      bestNames = n; bestDump = d; bestVerdict = v; bestTable = t; bestAt = System.currentTimeMillis();
+                  }
+              }
+          }
+          ___RXA_EOF___
+          cat > app/src/main/java/com/racexai/rankdemo/DemoService.java <<'___RXA_EOF___'
+          package com.racexai.rankdemo;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.graphics.Rect;
+          import android.os.Handler;
+          import android.os.HandlerThread;
+          import android.os.SystemClock;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+          import android.view.accessibility.AccessibilityWindowInfo;
+
+          import java.util.List;
+
+          /**
+           * Reads whatever is on the other half of the screen and tries to find the
+           * game's Win Rate Rank table in it.
+           *
+           * Deliberately a cut-down copy of the real app's WatchService: the same
+           * window walk, the same one-line-per-view format, the same parser. It has
+           * to be the same, or a demo that works proves nothing about the app and a
+           * demo that fails sends me chasing a difference between the two rigs
+           * instead of the difference that matters.
+           *
+           * What it does NOT do is anything the real app does with the result. No
+           * filling, no logging, no speaking, no taps - it reads a screen somebody
+           * has opened themselves and prints what it made of it. That is the entire
+           * program.
+           */
+          public class DemoService extends AccessibilityService {
+
+              private static final long GAP = 1000;      // one look a second is plenty here
+              private static final int MAX_NODES = 3000;
+
+              private Handler reader;
+              private volatile long last = 0;
+              private int walked = 0;
+
+              @Override
+              protected void onServiceConnected() {
+                  HandlerThread t = new HandlerThread("rankdemo");
+                  t.start();
+                  reader = new Handler(t.getLooper());
+                  Seen.live = true;
+                  Seen.verdict = "running - open Win Rate Rank in the game";
+              }
+
+              @Override public void onInterrupt() { }
+
+              @Override
+              public void onDestroy() {
+                  Seen.live = false;
+                  super.onDestroy();
+              }
+
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent event) {
+                  long now = SystemClock.elapsedRealtime();
+                  if (now - last < GAP) return;
+                  last = now;
+                  if (reader == null) { scan(); return; }
+                  reader.post(new Runnable() { @Override public void run() { scan(); } });
+              }
+
+              private void scan() {
+                  StringBuilder sb = new StringBuilder();
+                  StringBuilder pkgs = new StringBuilder();
+                  walked = 0;
+                  List<AccessibilityWindowInfo> windows = null;
+                  try { windows = getWindows(); } catch (Exception ignored) { }
+                  if (windows == null) return;
+
+                  for (AccessibilityWindowInfo w : windows) {
+                      if (w == null) continue;
+                      try { if (w.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue; }
+                      catch (Exception ignored) { }
+                      AccessibilityNodeInfo root = null;
+                      try { root = w.getRoot(); } catch (Exception ignored) { }
+                      if (root == null) continue;
+                      CharSequence p = root.getPackageName();
+                      String ps = p == null ? "" : p.toString();
+                      // everything except ourselves - the game ships under several names
+                      // and a package test is how the real app spent weeks reading nothing
+                      if (!ps.equals(getPackageName())) {
+                          if (ps.length() > 0 && pkgs.indexOf(ps) < 0) pkgs.append(ps).append(' ');
+                          walk(root, sb);
+                      }
+                      try { root.recycle(); } catch (Exception ignored) { }
+                  }
+
+                  String dump = sb.toString();
+                  Seen.passes++;
+                  Seen.at = System.currentTimeMillis();
+                  Seen.pkg = pkgs.toString().trim();
+                  Seen.dump = dump;
+
+                  int names = RaceReader.vehicleLabels(dump);
+                  Seen.names = names;
+                  if (names == 0) {
+                      Seen.verdict = "no vehicle names on screen";
+                      Seen.table = "";
+                      Seen.rows = 0;
+                      return;
+                  }
+                  RaceReader.Rank r = RaceReader.parseRank(dump);
+                  Seen.rows = r.rows.size();
+                  Seen.margin = r.margin;
+                  if (!r.rows.isEmpty()) {
+                      StringBuilder t = new StringBuilder();
+                      for (RaceReader.RankRow row : r.rows)
+                          t.append(String.format("  %-14s %5.1f%%   %.2fx   (%.3f)\n",
+                                  row.vehicle, row.winPct, row.payout, row.margin()));
+                      Seen.table = t.toString();
+                      Seen.verdict = "READ " + r.rows.size() + "/9";
+                  } else {
+                      Seen.table = "";
+                      Seen.verdict = "could not read it: " + r.why;
+                  }
+                  Seen.keepIfBest(dump, names, Seen.verdict, Seen.table);
+              }
+
+              /** Byte-for-byte the format RaceReader is written and tested against. */
+              private void walk(AccessibilityNodeInfo n, StringBuilder sb) {
+                  if (n == null || walked >= MAX_NODES) return;
+                  walked++;
+                  String id = n.getViewIdResourceName();
+                  CharSequence text = n.getText();
+                  CharSequence desc = n.getContentDescription();
+                  boolean says = (text != null && text.length() > 0)
+                              || (desc != null && desc.length() > 0);
+                  if (id != null || says) {
+                      sb.append("* id=").append(id == null ? "-" : id);
+                      if (text != null && text.length() > 0) sb.append(" TEXT=\"").append(text).append('"');
+                      if (desc != null && desc.length() > 0) sb.append(" DESC=\"").append(desc).append('"');
+                      Rect r = new Rect();
+                      n.getBoundsInScreen(r);
+                      sb.append(" [").append(r.left).append(',').append(r.top)
+                        .append('-').append(r.right).append(',').append(r.bottom).append("]\n");
+                  }
+                  int kids = n.getChildCount();
+                  for (int i = 0; i < kids && walked < MAX_NODES; i++) {
+                      AccessibilityNodeInfo c = null;
+                      try { c = n.getChild(i); } catch (Exception ignored) { }
+                      if (c != null) { walk(c, sb); try { c.recycle(); } catch (Exception ignored) { } }
+                  }
+              }
+          }
+          ___RXA_EOF___
+          cat > app/src/main/java/com/racexai/rankdemo/MainActivity.java <<'___RXA_EOF___'
+          package com.racexai.rankdemo;
+
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.Settings;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          /**
+           * One screen. It shows what the reader made of the game's Win Rate Rank
+           * table, and - much more usefully when it goes wrong - exactly what was on
+           * the screen it was looking at.
+           *
+           * The point of this app is to answer one question before the real app ever
+           * changes: does Chamet's rank screen put its numbers in the view tree at
+           * all, and if so does the parser pair them up correctly? Both answers are
+           * on this screen, and if the answer is no, the Copy button hands over the
+           * raw view tree so the parser can be fixed against the real thing rather
+           * than against a guess at it.
+           *
+           * No WebView, no database, no network. It reads a screen and prints it.
+           */
+          public class MainActivity extends Activity {
+
+              private TextView out;
+              private final Handler tick = new Handler(Looper.getMainLooper());
+              private final Runnable refresh = new Runnable() {
+                  @Override public void run() { draw(); tick.postDelayed(this, 700); }
+              };
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(0xFF0B0B10);
+                  root.setPadding(24, 40, 24, 24);
+
+                  TextView title = new TextView(this);
+                  title.setText("Win Rate Rank — reader test");
+                  title.setTextColor(0xFF7C6FFF);
+                  title.setTextSize(19);
+                  title.setTypeface(Typeface.DEFAULT_BOLD);
+                  root.addView(title);
+
+                  TextView how = new TextView(this);
+                  how.setText("1. Turn this on in Accessibility settings.\n"
+                            + "2. Put this app and the game side by side in split screen.\n"
+                            + "3. Open Win Rate Rank in the game.\n"
+                            + "It reads only. It does not tap anything.");
+                  how.setTextColor(0xFF9A9AB0);
+                  how.setTextSize(12);
+                  how.setPadding(0, 10, 0, 14);
+                  root.addView(how);
+
+                  LinearLayout btns = new LinearLayout(this);
+                  btns.setOrientation(LinearLayout.HORIZONTAL);
+                  btns.addView(button("Accessibility", new View.OnClickListener() {
+                      @Override public void onClick(View v) {
+                          try { startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)); }
+                          catch (Exception e) { toast("Open Settings > Accessibility yourself"); }
+                      }
+                  }));
+                  btns.addView(button("Copy screen", new View.OnClickListener() {
+                      @Override public void onClick(View v) { copy(); }
+                  }));
+                  root.addView(btns);
+
+                  out = new TextView(this);
+                  out.setTextColor(0xFFE8E8F0);
+                  out.setTextSize(11);
+                  out.setTypeface(Typeface.MONOSPACE);
+                  out.setPadding(0, 16, 0, 0);
+                  out.setTextIsSelectable(true);
+
+                  ScrollView sc = new ScrollView(this);
+                  sc.addView(out);
+                  root.addView(sc, new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+                  setContentView(root);
+              }
+
+              private Button button(String label, View.OnClickListener on) {
+                  Button b = new Button(this);
+                  b.setText(label);
+                  b.setTextSize(12);
+                  b.setAllCaps(false);
+                  b.setOnClickListener(on);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
+                          ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+                  lp.setMargins(0, 0, 10, 0);
+                  b.setLayoutParams(lp);
+                  return b;
+              }
+
+              @Override protected void onResume() { super.onResume(); tick.post(refresh); }
+              @Override protected void onPause()  { tick.removeCallbacks(refresh); super.onPause(); }
+
+              private void draw() {
+                  StringBuilder s = new StringBuilder();
+
+                  if (!Seen.live) {
+                      s.append("● The reader is NOT running.\n")
+                       .append("  Tap Accessibility above, find \"Win Rate Rank test\"\n")
+                       .append("  in the list, and switch it on.\n\n");
+                  } else {
+                      s.append("● Running.  ").append(Seen.passes).append(" screens read")
+                       .append(Seen.pkg.length() > 0 ? "   from: " + Seen.pkg : "   (nothing else on screen yet)")
+                       .append("\n\n");
+                  }
+
+                  s.append("── right now ──\n");
+                  s.append("  vehicle names on screen : ").append(Seen.names).append(" of 9\n");
+                  s.append("  verdict                 : ").append(Seen.verdict).append('\n');
+                  if (Seen.rows > 0) {
+                      s.append("  the game's margin       : ").append(String.format("%.3f", Seen.margin))
+                       .append("   (should be near 0.98)\n");
+                  }
+                  if (Seen.table.length() > 0) {
+                      s.append("\n  vehicle          win %   payout   margin\n").append(Seen.table);
+                  }
+
+                  // The best frame so far, because the rank screen gets closed again and
+                  // the live view would then be showing the party behind it.
+                  if (Seen.bestNames > 0 && Seen.bestNames != Seen.names) {
+                      s.append("\n── the best screen seen so far ──\n");
+                      s.append("  ").append(Seen.bestNames).append(" of 9 named  ·  ").append(Seen.bestVerdict).append('\n');
+                      if (Seen.bestTable.length() > 0) s.append(Seen.bestTable);
+                  }
+
+                  // and the raw thing, which is the whole point when it fails
+                  String dump = Seen.bestNames > 0 ? Seen.bestDump : Seen.dump;
+                  s.append("\n── what was actually on the screen ──\n");
+                  if (dump.length() == 0) {
+                      s.append("  (nothing read yet)\n");
+                  } else {
+                      // only the lines that say something - a view tree is mostly
+                      // containers, and they are noise here
+                      int shown = 0;
+                      for (String line : dump.split("\n")) {
+                          if (line.indexOf("TEXT=\"") < 0 && line.indexOf("DESC=\"") < 0) continue;
+                          s.append("  ").append(line).append('\n');
+                          if (++shown >= 120) { s.append("  ... (Copy screen for the rest)\n"); break; }
+                      }
+                      if (shown == 0) s.append("  no view on screen carries any text at all.\n")
+                                       .append("  the game is drawing it as a picture, not writing it.\n");
+                  }
+
+                  out.setText(s.toString());
+              }
+
+              private void copy() {
+                  String dump = Seen.bestNames > 0 ? Seen.bestDump : Seen.dump;
+                  if (dump.length() == 0) { toast("Nothing read yet"); return; }
+                  try {
+                      ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                      cm.setPrimaryClip(ClipData.newPlainText("rank dump",
+                              "verdict: " + Seen.bestVerdict + "\nnames: " + Seen.bestNames
+                            + "\npackage: " + Seen.pkg + "\n\n" + dump));
+                      toast("Copied - paste it into the chat");
+                  } catch (Exception e) { toast("Could not copy: " + e); }
+              }
+
+              private void toast(String m) { Toast.makeText(this, m, Toast.LENGTH_SHORT).show(); }
+          }
+          ___RXA_EOF___
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        run: |
+          gradle wrapper --no-daemon
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Name it something findable
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/debug/app-debug.apk out/RankDemo.apk
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RankDemo-apk
+          path: out/RankDemo.apk
+          if-no-files-found: error
